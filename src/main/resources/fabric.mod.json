@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "ahbuyer",
+  "version": "${version}",
+  "name": "AH Buyer",
+  "description": "Automatycznie kupuje przedmioty z /ah po ustawionej cenie.",
+  "environment": "client",
+  "entrypoints": { "client": ["pl.ahbuyer.AhBuyerClient"] },
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "~1.21.4",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
