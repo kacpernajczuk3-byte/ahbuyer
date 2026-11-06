@@ -12,17 +12,24 @@ import net.minecraft.screen.slot.Slot;
 import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.text.Text;
 
+import java.util.List;
+
 public class AhBuyer {
+	private static final List<String> NEXT_WORDS = List.of("następn", "nastepn", "next", "dalej", "→", "»", ">>");
+	private static final List<String> PREV_WORDS = List.of("poprzedni", "previous", "prev", "wstecz", "←", "«", "<<");
+
 	private static int cooldown = 0;
 	private static long lastOpen = 0;
 	private static long screenSince = 0;
 	private static int lastSyncId = -1;
 	private static boolean ourSession = false;
+	private static boolean pendingPrev = false;
 
 	public static void tick(MinecraftClient mc) {
 		AhConfig cfg = AhConfig.get();
 		if (!cfg.enabled || mc.player == null || mc.interactionManager == null) {
 			ourSession = false;
+			pendingPrev = false;
 			return;
 		}
 		if (cooldown > 0) { cooldown--; return; }
@@ -33,6 +40,7 @@ public class AhBuyer {
 		// Brak otwartego GUI -> otwieramy AH
 		if (s == null) {
 			ourSession = false;
+			pendingPrev = false;
 			lastSyncId = -1;
 			if (now - lastOpen >= (long) (cfg.refreshSeconds * 1000)) {
 				mc.player.networkHandler.sendChatCommand(cfg.openCommand);
@@ -93,16 +101,52 @@ public class AhBuyer {
 		if (best != null) {
 			mc.interactionManager.clickSlot(h.syncId, best.id, 0, SlotActionType.PICKUP, mc.player);
 			mc.player.sendMessage(Text.literal("§a[AH Buyer] §fKlik: " + bestName + " za " + bestPrice), false);
+			pendingPrev = false;
 			cooldown = cfg.clickDelayTicks;
 			screenSince = now;
 			return;
 		}
 
-		// 3) Nic nie ma -> zamknij i odśwież po czasie
+		// 3) Nic nie ma -> wróć na poprzednią stronę (jeśli wcześniej kliknęliśmy następną)
+		if (pendingPrev) {
+			pendingPrev = false;
+			Slot prev = findButton(h, size, PREV_WORDS);
+			if (prev != null) {
+				mc.interactionManager.clickSlot(h.syncId, prev.id, 0, SlotActionType.PICKUP, mc.player);
+				cooldown = cfg.clickDelayTicks + 2;
+				screenSince = now;
+				return;
+			}
+			mc.player.closeHandledScreen();
+			cooldown = 10;
+			return;
+		}
+
+		// 4) Odświeżenie: kliknij następną stronę, potem poprzednią
 		if (now - screenSince >= (long) (cfg.refreshSeconds * 1000)) {
+			Slot next = findButton(h, size, NEXT_WORDS);
+			if (next != null) {
+				mc.interactionManager.clickSlot(h.syncId, next.id, 0, SlotActionType.PICKUP, mc.player);
+				pendingPrev = true;
+				cooldown = cfg.clickDelayTicks + 6;
+				return;
+			}
 			mc.player.closeHandledScreen();
 			cooldown = 10;
 		}
+	}
+
+	private static Slot findButton(GenericContainerScreenHandler h, int size, List<String> words) {
+		for (int i = 0; i < size; i++) {
+			Slot slot = h.slots.get(i);
+			ItemStack st = slot.getStack();
+			if (st.isEmpty()) continue;
+			String name = st.getName().getString().toLowerCase();
+			for (String w : words) {
+				if (name.contains(w)) return slot;
+			}
+		}
+		return null;
 	}
 
 	private static double readPrice(ItemStack st, String keyword) {
