@@ -75,7 +75,7 @@ public class AhScreen extends Screen {
 			return;
 		}
 		AhConfig cfg = AhConfig.get();
-		cfg.entries.removeIf(e -> raw.equals(e.item));
+		cfg.entries.removeIf(e -> id.toString().equals(e.item));
 		cfg.entries.add(new AhConfig.Entry(id.toString(), price));
 		cfg.save();
 		status = "§aDodano: " + id;
