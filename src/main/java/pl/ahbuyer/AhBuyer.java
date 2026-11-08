@@ -17,10 +17,11 @@ import java.util.List;
 public class AhBuyer {
 	private static final List<String> NEXT_WORDS = List.of("następn", "nastepn", "next", "dalej", "→", "»", ">>");
 	private static final List<String> PREV_WORDS = List.of("poprzedni", "previous", "prev", "wstecz", "←", "«", "<<");
+	private static final List<String> AH_WORDS = List.of("twoje przedmioty", "sortowanie", "filtrowanie", "wyszukiwanie");
 
 	private static int cooldown = 0;
 	private static long lastOpen = 0;
-	private static long screenSince = 0;
+	private static long lastActionAt = 0;
 	private static int lastSyncId = -1;
 	private static boolean ourSession = false;
 	private static boolean pendingPrev = false;
@@ -39,10 +40,11 @@ public class AhBuyer {
 
 		// Brak otwartego GUI -> otwieramy AH
 		if (s == null) {
-			ourSession = false;
 			pendingPrev = false;
 			lastSyncId = -1;
-			if (now - lastOpen >= (long) (cfg.refreshSeconds * 1000)) {
+			long since = now - lastOpen;
+			if (since > 4000) ourSession = false;
+			if (since >= Math.max(1500L, (long) (cfg.refreshSeconds * 1000))) {
 				mc.player.networkHandler.sendChatCommand(cfg.openCommand);
 				lastOpen = now;
 				ourSession = true;
@@ -50,17 +52,25 @@ public class AhBuyer {
 			return;
 		}
 
-		if (!ourSession || !(s instanceof GenericContainerScreen gcs)) return;
+		if (!(s instanceof GenericContainerScreen gcs)) return;
 
 		GenericContainerScreenHandler h = gcs.getScreenHandler();
-		if (h.syncId != lastSyncId) { // nowe okno - poczekaj aż przyjdą itemy
+		int size = h.getRows() * 9;
+
+		// Nowe okno - poczekaj aż przyjdą itemy
+		if (h.syncId != lastSyncId) {
 			lastSyncId = h.syncId;
-			screenSince = now;
-			cooldown = cfg.clickDelayTicks + 2;
+			lastActionAt = now;
+			cooldown = cfg.clickDelayTicks + 4;
 			return;
 		}
 
-		int size = h.getRows() * 9;
+		// Czy to okno AH? (po przyciskach) albo otworzone przez nas
+		boolean isAh = ourSession
+				|| findButton(h, size, NEXT_WORDS) != null
+				|| findButton(h, size, PREV_WORDS) != null
+				|| findButton(h, size, AH_WORDS) != null;
+		if (!isAh) return;
 
 		// 1) Okno potwierdzenia?
 		for (int i = 0; i < size; i++) {
@@ -80,7 +90,7 @@ public class AhBuyer {
 			}
 		}
 
-		// 2) Szukamy najtańszej pasującej oferty
+		// 2) Szukamy najtańszej pasującej oferty na tej stronie
 		Slot best = null;
 		double bestPrice = Double.MAX_VALUE;
 		String bestName = "";
@@ -103,18 +113,19 @@ public class AhBuyer {
 			mc.player.sendMessage(Text.literal("§a[AH Buyer] §fKlik: " + bestName + " za " + bestPrice), false);
 			pendingPrev = false;
 			cooldown = cfg.clickDelayTicks;
-			screenSince = now;
+			lastActionAt = now;
 			return;
 		}
 
-		// 3) Nic nie ma -> wróć na poprzednią stronę (jeśli wcześniej kliknęliśmy następną)
+		// 3) Jesteśmy na stronie 2 -> wróć na poprzednią
 		if (pendingPrev) {
 			pendingPrev = false;
 			Slot prev = findButton(h, size, PREV_WORDS);
 			if (prev != null) {
 				mc.interactionManager.clickSlot(h.syncId, prev.id, 0, SlotActionType.PICKUP, mc.player);
-				cooldown = cfg.clickDelayTicks + 2;
-				screenSince = now;
+				mc.player.sendMessage(Text.literal("§e[AH Buyer] Poprzednia strona"), true);
+				cooldown = cfg.clickDelayTicks + 4;
+				lastActionAt = now;
 				return;
 			}
 			mc.player.closeHandledScreen();
@@ -122,17 +133,23 @@ public class AhBuyer {
 			return;
 		}
 
-		// 4) Odświeżenie: kliknij następną stronę, potem poprzednią
-		if (now - screenSince >= (long) (cfg.refreshSeconds * 1000)) {
+		// 4) Odświeżenie: kliknij następną stronę
+		long wait = Math.max(600L, (long) (cfg.refreshSeconds * 1000 / 3));
+		if (now - lastActionAt >= wait) {
 			Slot next = findButton(h, size, NEXT_WORDS);
 			if (next != null) {
 				mc.interactionManager.clickSlot(h.syncId, next.id, 0, SlotActionType.PICKUP, mc.player);
+				mc.player.sendMessage(Text.literal("§e[AH Buyer] Nastepna strona"), true);
 				pendingPrev = true;
 				cooldown = cfg.clickDelayTicks + 6;
+				lastActionAt = now;
 				return;
 			}
-			mc.player.closeHandledScreen();
-			cooldown = 10;
+			if (now - lastActionAt >= (long) (cfg.refreshSeconds * 1000)) {
+				mc.player.sendMessage(Text.literal("§c[AH Buyer] Nie widze przycisku Nastepna strona"), true);
+				mc.player.closeHandledScreen();
+				cooldown = 10;
+			}
 		}
 	}
 
