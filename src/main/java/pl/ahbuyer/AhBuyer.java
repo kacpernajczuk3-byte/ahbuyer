@@ -21,34 +21,63 @@ public class AhBuyer {
 	private static final List<String> CONFIRM_WORDS = List.of("potwierd", "confirm");
 	private static final List<String> CANCEL_WORDS = List.of("anuluj", "cancel");
 
+	private static final long CONFIRM_DELAY_MS = 350;  // czekanie przed kliknięciem "Potwierdź"
+	private static final long CONFIRM_RETRY_MS = 1200; // ponowienie, jeśli okno dalej wisi
+
 	private static long lastOpen = 0;
-	private static long lastActionAt = 0;
 	private static long lastWarn = 0;
 	private static long awaitConfirmUntil = 0;
 	private static long noBuyUntil = 0;
 	private static double expectedMax = 0;
 	private static int lastSyncId = -1;
 	private static boolean ourSession = false;
-	private static int pagesAhead = 0;
+
+	private static long confirmSeenAt = 0;
+	private static long lastConfirmClick = 0;
+	private static int confirmClicks = 0;
+
+	private static int pendingKind = 0; // 0 brak, 1 następna, 2 poprzednia
 	private static String sigBefore = null;
 	private static long waitSince = 0;
+	private static boolean atPage1 = true;
+	private static int prevFails = 0;
+
+	private static void resolve(boolean changed) {
+		if (pendingKind == 1 && changed) {
+			atPage1 = false;
+		} else if (pendingKind == 2) {
+			if (changed) { atPage1 = true; prevFails = 0; }
+			else if (++prevFails >= 2) { atPage1 = true; prevFails = 0; }
+		}
+		pendingKind = 0;
+		sigBefore = null;
+	}
+
+	private static void reset() {
+		pendingKind = 0;
+		sigBefore = null;
+		atPage1 = true;
+		prevFails = 0;
+	}
 
 	public static void tick(MinecraftClient mc) {
 		AhConfig cfg = AhConfig.get();
 		if (!cfg.enabled || mc.player == null || mc.interactionManager == null) {
 			ourSession = false;
-			pagesAhead = 0;
-			sigBefore = null;
+			confirmSeenAt = 0;
+			confirmClicks = 0;
+			reset();
 			return;
 		}
 
 		long now = System.currentTimeMillis();
 		Screen s = mc.currentScreen;
 
-		// Brak otwartego GUI -> otwieramy AH od strony 1
+		// Brak otwartego GUI -> otwieramy AH
 		if (s == null) {
-			pagesAhead = 0;
-			sigBefore = null;
+			reset();
+			confirmSeenAt = 0;
+			confirmClicks = 0;
 			lastSyncId = -1;
 			long since = now - lastOpen;
 			if (since > 3000) ourSession = false;
@@ -67,8 +96,8 @@ public class AhBuyer {
 
 		if (h.syncId != lastSyncId) {
 			lastSyncId = h.syncId;
-			sigBefore = null;
-			lastActionAt = now;
+			confirmSeenAt = 0;
+			if (pendingKind != 0) resolve(true);
 		}
 
 		// Okno jeszcze puste - czekaj
@@ -82,22 +111,43 @@ public class AhBuyer {
 		Slot cancel = findButton(h, size, CANCEL_WORDS);
 		Slot confirm = findButton(h, size, CONFIRM_WORDS);
 		if (cancel != null && confirm != null) {
+			if (confirmSeenAt == 0) confirmSeenAt = now;
 			double cp = readPrice(confirm.getStack(), cfg.priceKeyword);
 			boolean ours = now < awaitConfirmUntil;
 			boolean priceOk = cp < 0 || cp <= expectedMax;
+
 			if (ours && priceOk) {
+				if (now - confirmSeenAt < CONFIRM_DELAY_MS) return;        // jeszcze za wcześnie
+				if (now - lastConfirmClick < CONFIRM_RETRY_MS) return;     // czekamy na serwer
+				if (confirmClicks >= 3) {
+					mc.interactionManager.clickSlot(h.syncId, cancel.id, 0, SlotActionType.PICKUP, mc.player);
+					awaitConfirmUntil = 0;
+					confirmClicks = 0;
+					return;
+				}
 				mc.interactionManager.clickSlot(h.syncId, confirm.id, 0, SlotActionType.PICKUP, mc.player);
-				mc.player.sendMessage(Text.literal("§a[AH Buyer] Potwierdzono zakup"), true);
-			} else {
-				mc.interactionManager.clickSlot(h.syncId, cancel.id, 0, SlotActionType.PICKUP, mc.player);
-				if (ours) mc.player.sendMessage(Text.literal("§c[AH Buyer] Cena za wysoka - anulowano"), true);
+				mc.player.sendMessage(Text.literal("§a[AH Buyer] Potwierdzam zakup"), true);
+				lastConfirmClick = now;
+				confirmClicks++;
+				return;
 			}
+
+			// nie nasz zakup albo za wysoka cena -> anuluj
+			if (now - confirmSeenAt < 150) return;
+			mc.interactionManager.clickSlot(h.syncId, cancel.id, 0, SlotActionType.PICKUP, mc.player);
+			if (ours) mc.player.sendMessage(Text.literal("§c[AH Buyer] Cena za wysoka - anulowano"), true);
 			awaitConfirmUntil = 0;
-			pagesAhead = 0;
-			sigBefore = null;
+			confirmSeenAt = 0;
 			noBuyUntil = now + 300;
-			lastActionAt = now;
+			reset();
 			return;
+		} else if (confirmClicks > 0 || confirmSeenAt != 0) {
+			// okno potwierdzenia zniknęło - zakup załatwiony
+			confirmSeenAt = 0;
+			confirmClicks = 0;
+			awaitConfirmUntil = 0;
+			noBuyUntil = now + 300;
+			reset();
 		}
 
 		// Czy to okno AH?
@@ -107,11 +157,11 @@ public class AhBuyer {
 				|| findButton(h, size, AH_WORDS) != null;
 		if (!isAh) return;
 
-		// Po kliknięciu strony czekamy aż serwer podmieni zawartość
-		if (sigBefore != null) {
+		// Czekamy na efekt ostatniego kliknięcia strony
+		if (pendingKind != 0) {
 			String sig = signature(h, size);
-			if (!sig.equals(sigBefore)) sigBefore = null;
-			else if (now - waitSince > 1200) sigBefore = null;
+			if (!sig.equals(sigBefore)) resolve(true);
+			else if (now - waitSince > 600) resolve(false);
 			else return;
 		}
 
@@ -138,45 +188,37 @@ public class AhBuyer {
 			if (best != null) {
 				mc.interactionManager.clickSlot(h.syncId, best.id, 0, SlotActionType.PICKUP, mc.player);
 				mc.player.sendMessage(Text.literal("§a[AH Buyer] §fKlik: " + bestName + " za " + bestPrice), false);
-				awaitConfirmUntil = now + 4000;
+				awaitConfirmUntil = now + 8000;
 				expectedMax = bestMax;
 				noBuyUntil = now + 1500;
-				lastActionAt = now;
+				confirmSeenAt = 0;
+				confirmClicks = 0;
 				return;
 			}
 		}
 
-		// 3) Jesteśmy do przodu -> wracamy na stronę 1
-		if (pagesAhead > 0) {
-			Slot prev = findButton(h, size, PREV_WORDS);
-			if (prev != null) {
-				String sig = signature(h, size);
-				mc.interactionManager.clickSlot(h.syncId, prev.id, 0, SlotActionType.PICKUP, mc.player);
-				pagesAhead--;
-				sigBefore = sig;
-				waitSince = now;
-				lastActionAt = now;
-				return;
-			}
-			if (now - lastActionAt > 3000) {
-				pagesAhead = 0;
-				mc.player.closeHandledScreen();
-			}
-			return;
-		}
-
-		// 4) Jesteśmy na stronie 1 -> kliknij następną
+		// 3) Przerzucanie stron na podstawie tego, co widać w oknie
+		Slot prev = findButton(h, size, PREV_WORDS);
 		Slot next = findButton(h, size, NEXT_WORDS);
-		if (next != null) {
-			String sig = signature(h, size);
-			mc.interactionManager.clickSlot(h.syncId, next.id, 0, SlotActionType.PICKUP, mc.player);
-			pagesAhead = 1;
-			sigBefore = sig;
+
+		if (!atPage1 && prev != null) {
+			sigBefore = signature(h, size);
+			mc.interactionManager.clickSlot(h.syncId, prev.id, 0, SlotActionType.PICKUP, mc.player);
+			pendingKind = 2;
 			waitSince = now;
-			lastActionAt = now;
+		} else if (next != null) {
+			sigBefore = signature(h, size);
+			mc.interactionManager.clickSlot(h.syncId, next.id, 0, SlotActionType.PICKUP, mc.player);
+			pendingKind = 1;
+			waitSince = now;
+		} else if (prev != null) {
+			sigBefore = signature(h, size);
+			mc.interactionManager.clickSlot(h.syncId, prev.id, 0, SlotActionType.PICKUP, mc.player);
+			pendingKind = 2;
+			waitSince = now;
 		} else if (now - lastWarn > 5000) {
 			lastWarn = now;
-			mc.player.sendMessage(Text.literal("§c[AH Buyer] Nie widze przycisku Nastepna strona"), true);
+			mc.player.sendMessage(Text.literal("§c[AH Buyer] Nie widze przyciskow stron"), true);
 		}
 	}
 
