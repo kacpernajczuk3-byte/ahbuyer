@@ -21,17 +21,16 @@ public class AhBuyer {
 	private static final List<String> CONFIRM_WORDS = List.of("potwierd", "confirm");
 	private static final List<String> CANCEL_WORDS = List.of("anuluj", "cancel");
 
-	private static int cooldown = 0;
 	private static long lastOpen = 0;
 	private static long lastActionAt = 0;
 	private static long lastWarn = 0;
 	private static long awaitConfirmUntil = 0;
+	private static long noBuyUntil = 0;
+	private static double expectedMax = 0;
 	private static int lastSyncId = -1;
 	private static boolean ourSession = false;
 	private static int pagesAhead = 0;
-
-	private static String lastSig = "";
-	private static String sigBefore = null; // != null -> czekamy aż strona się zmieni
+	private static String sigBefore = null;
 	private static long waitSince = 0;
 
 	public static void tick(MinecraftClient mc) {
@@ -42,7 +41,6 @@ public class AhBuyer {
 			sigBefore = null;
 			return;
 		}
-		if (cooldown > 0) { cooldown--; return; }
 
 		long now = System.currentTimeMillis();
 		Screen s = mc.currentScreen;
@@ -51,11 +49,10 @@ public class AhBuyer {
 		if (s == null) {
 			pagesAhead = 0;
 			sigBefore = null;
-			lastSig = "";
 			lastSyncId = -1;
 			long since = now - lastOpen;
-			if (since > 4000) ourSession = false;
-			if (since >= 1500L) {
+			if (since > 3000) ourSession = false;
+			if (since >= 700L) {
 				mc.player.networkHandler.sendChatCommand(cfg.openCommand);
 				lastOpen = now;
 				ourSession = true;
@@ -68,38 +65,37 @@ public class AhBuyer {
 		GenericContainerScreenHandler h = gcs.getScreenHandler();
 		int size = h.getRows() * 9;
 
-		// Nowe okno - poczekaj aż przyjdą itemy
 		if (h.syncId != lastSyncId) {
 			lastSyncId = h.syncId;
-			lastSig = "";
 			sigBefore = null;
 			lastActionAt = now;
-			cooldown = cfg.clickDelayTicks + 1;
-			return;
 		}
 
-		// Strona jeszcze się ładuje (puste okno) - czekaj
+		// Okno jeszcze puste - czekaj
 		boolean loaded = false;
 		for (int i = 0; i < size; i++) {
 			if (!h.slots.get(i).getStack().isEmpty()) { loaded = true; break; }
 		}
 		if (!loaded) return;
 
-		// 1) Okno potwierdzenia zakupu (przyciski Anuluj + Potwierdź)
+		// 1) Okno potwierdzenia zakupu (Anuluj + Potwierdź)
 		Slot cancel = findButton(h, size, CANCEL_WORDS);
 		Slot confirm = findButton(h, size, CONFIRM_WORDS);
 		if (cancel != null && confirm != null) {
-			if (now < awaitConfirmUntil) {
+			double cp = readPrice(confirm.getStack(), cfg.priceKeyword);
+			boolean ours = now < awaitConfirmUntil;
+			boolean priceOk = cp < 0 || cp <= expectedMax;
+			if (ours && priceOk) {
 				mc.interactionManager.clickSlot(h.syncId, confirm.id, 0, SlotActionType.PICKUP, mc.player);
 				mc.player.sendMessage(Text.literal("§a[AH Buyer] Potwierdzono zakup"), true);
-				awaitConfirmUntil = 0;
 			} else {
 				mc.interactionManager.clickSlot(h.syncId, cancel.id, 0, SlotActionType.PICKUP, mc.player);
+				if (ours) mc.player.sendMessage(Text.literal("§c[AH Buyer] Cena za wysoka - anulowano"), true);
 			}
+			awaitConfirmUntil = 0;
 			pagesAhead = 0;
 			sigBefore = null;
-			lastSig = "";
-			cooldown = cfg.clickDelayTicks + 2;
+			noBuyUntil = now + 300;
 			lastActionAt = now;
 			return;
 		}
@@ -111,65 +107,60 @@ public class AhBuyer {
 				|| findButton(h, size, AH_WORDS) != null;
 		if (!isAh) return;
 
-		// Czekamy aż zawartość okna się ustabilizuje
-		String sig = signature(h, size);
-		boolean settled = sig.equals(lastSig);
-		lastSig = sig;
-		if (!settled) return;
-
-		// Po kliknięciu strony czekamy aż zawartość faktycznie się zmieni
+		// Po kliknięciu strony czekamy aż serwer podmieni zawartość
 		if (sigBefore != null) {
+			String sig = signature(h, size);
 			if (!sig.equals(sigBefore)) sigBefore = null;
-			else if (now - waitSince > 3500) sigBefore = null;
+			else if (now - waitSince > 1200) sigBefore = null;
 			else return;
 		}
 
-		// 2) Szukamy najtańszej pasującej oferty na tej stronie
-		Slot best = null;
-		double bestPrice = Double.MAX_VALUE;
-		String bestName = "";
-		for (int i = 0; i < size; i++) {
-			Slot slot = h.slots.get(i);
-			ItemStack st = slot.getStack();
-			if (st.isEmpty()) continue;
-			String id = Registries.ITEM.getId(st.getItem()).toString();
-			for (AhConfig.Entry e : cfg.entries) {
-				if (e.item == null || !e.item.equalsIgnoreCase(id)) continue;
-				double price = readPrice(st, cfg.priceKeyword);
-				if (price >= 0 && price <= e.maxPrice && price < bestPrice) {
-					best = slot; bestPrice = price; bestName = st.getCount() + "x " + st.getName().getString();
+		// 2) Kupno: najtańsza pasująca oferta na tej stronie
+		if (now >= noBuyUntil) {
+			Slot best = null;
+			double bestPrice = Double.MAX_VALUE;
+			double bestMax = 0;
+			String bestName = "";
+			for (int i = 0; i < size; i++) {
+				Slot slot = h.slots.get(i);
+				ItemStack st = slot.getStack();
+				if (st.isEmpty()) continue;
+				String id = Registries.ITEM.getId(st.getItem()).toString();
+				for (AhConfig.Entry e : cfg.entries) {
+					if (e.item == null || !e.item.equalsIgnoreCase(id)) continue;
+					double price = readPrice(st, cfg.priceKeyword);
+					if (price >= 0 && price <= e.maxPrice && price < bestPrice) {
+						best = slot; bestPrice = price; bestMax = e.maxPrice;
+						bestName = st.getCount() + "x " + st.getName().getString();
+					}
 				}
 			}
-		}
-
-		if (best != null) {
-			mc.interactionManager.clickSlot(h.syncId, best.id, 0, SlotActionType.PICKUP, mc.player);
-			mc.player.sendMessage(Text.literal("§a[AH Buyer] §fKlik: " + bestName + " za " + bestPrice), false);
-			awaitConfirmUntil = now + 8000;
-			sigBefore = null;
-			lastSig = "";
-			cooldown = cfg.clickDelayTicks;
-			lastActionAt = now;
-			return;
+			if (best != null) {
+				mc.interactionManager.clickSlot(h.syncId, best.id, 0, SlotActionType.PICKUP, mc.player);
+				mc.player.sendMessage(Text.literal("§a[AH Buyer] §fKlik: " + bestName + " za " + bestPrice), false);
+				awaitConfirmUntil = now + 4000;
+				expectedMax = bestMax;
+				noBuyUntil = now + 1500;
+				lastActionAt = now;
+				return;
+			}
 		}
 
 		// 3) Jesteśmy do przodu -> wracamy na stronę 1
 		if (pagesAhead > 0) {
 			Slot prev = findButton(h, size, PREV_WORDS);
 			if (prev != null) {
+				String sig = signature(h, size);
 				mc.interactionManager.clickSlot(h.syncId, prev.id, 0, SlotActionType.PICKUP, mc.player);
-				mc.player.sendMessage(Text.literal("§e[AH Buyer] Poprzednia strona"), true);
 				pagesAhead--;
 				sigBefore = sig;
 				waitSince = now;
-				cooldown = cfg.clickDelayTicks;
 				lastActionAt = now;
 				return;
 			}
-			if (now - lastActionAt > 4000) {
+			if (now - lastActionAt > 3000) {
 				pagesAhead = 0;
 				mc.player.closeHandledScreen();
-				cooldown = 10;
 			}
 			return;
 		}
@@ -177,12 +168,11 @@ public class AhBuyer {
 		// 4) Jesteśmy na stronie 1 -> kliknij następną
 		Slot next = findButton(h, size, NEXT_WORDS);
 		if (next != null) {
+			String sig = signature(h, size);
 			mc.interactionManager.clickSlot(h.syncId, next.id, 0, SlotActionType.PICKUP, mc.player);
-			mc.player.sendMessage(Text.literal("§e[AH Buyer] Nastepna strona"), true);
 			pagesAhead = 1;
 			sigBefore = sig;
 			waitSince = now;
-			cooldown = cfg.clickDelayTicks;
 			lastActionAt = now;
 		} else if (now - lastWarn > 5000) {
 			lastWarn = now;
