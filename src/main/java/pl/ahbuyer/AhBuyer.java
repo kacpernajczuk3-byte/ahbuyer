@@ -18,10 +18,14 @@ public class AhBuyer {
 	private static final List<String> NEXT_WORDS = List.of("następn", "nastepn", "next", "dalej", "→", "»", ">>");
 	private static final List<String> PREV_WORDS = List.of("poprzedni", "previous", "prev", "wstecz", "←", "«", "<<");
 	private static final List<String> AH_WORDS = List.of("twoje przedmioty", "sortowanie", "filtrowanie", "wyszukiwanie");
+	private static final List<String> CONFIRM_WORDS = List.of("potwierd", "confirm");
+	private static final List<String> CANCEL_WORDS = List.of("anuluj", "cancel");
 
 	private static int cooldown = 0;
 	private static long lastOpen = 0;
 	private static long lastActionAt = 0;
+	private static long lastWarn = 0;
+	private static long awaitConfirmUntil = 0;
 	private static int lastSyncId = -1;
 	private static boolean ourSession = false;
 	private static boolean pendingPrev = false;
@@ -38,13 +42,13 @@ public class AhBuyer {
 		long now = System.currentTimeMillis();
 		Screen s = mc.currentScreen;
 
-		// Brak otwartego GUI -> otwieramy AH
+		// Brak otwartego GUI -> otwieramy AH (tylko gdy serwer zamknął okno)
 		if (s == null) {
 			pendingPrev = false;
 			lastSyncId = -1;
 			long since = now - lastOpen;
 			if (since > 4000) ourSession = false;
-			if (since >= Math.max(1500L, (long) (cfg.refreshSeconds * 1000))) {
+			if (since >= 1500L) {
 				mc.player.networkHandler.sendChatCommand(cfg.openCommand);
 				lastOpen = now;
 				ourSession = true;
@@ -65,30 +69,29 @@ public class AhBuyer {
 			return;
 		}
 
-		// Czy to okno AH? (po przyciskach) albo otworzone przez nas
+		// 1) Okno potwierdzenia zakupu (przyciski Anuluj + Potwierdź)
+		Slot cancel = findButton(h, size, CANCEL_WORDS);
+		Slot confirm = findButton(h, size, CONFIRM_WORDS);
+		if (cancel != null && confirm != null) {
+			if (now < awaitConfirmUntil) {
+				mc.interactionManager.clickSlot(h.syncId, confirm.id, 0, SlotActionType.PICKUP, mc.player);
+				mc.player.sendMessage(Text.literal("§a[AH Buyer] Potwierdzono zakup"), true);
+				awaitConfirmUntil = 0;
+			} else {
+				// to nie nasz zakup - anuluj (wraca do AH)
+				mc.interactionManager.clickSlot(h.syncId, cancel.id, 0, SlotActionType.PICKUP, mc.player);
+			}
+			cooldown = cfg.clickDelayTicks + 4;
+			lastActionAt = now;
+			return;
+		}
+
+		// Czy to okno AH?
 		boolean isAh = ourSession
 				|| findButton(h, size, NEXT_WORDS) != null
 				|| findButton(h, size, PREV_WORDS) != null
 				|| findButton(h, size, AH_WORDS) != null;
 		if (!isAh) return;
-
-		// 1) Okno potwierdzenia?
-		for (int i = 0; i < size; i++) {
-			Slot slot = h.slots.get(i);
-			ItemStack st = slot.getStack();
-			if (st.isEmpty()) continue;
-			String id = Registries.ITEM.getId(st.getItem()).getPath();
-			boolean greenish = id.contains("lime") || id.contains("green") || id.equals("emerald_block");
-			if (!greenish) continue;
-			String name = st.getName().getString().toLowerCase();
-			for (String w : cfg.confirmWords) {
-				if (!w.isBlank() && name.contains(w.toLowerCase())) {
-					mc.interactionManager.clickSlot(h.syncId, slot.id, 0, SlotActionType.PICKUP, mc.player);
-					cooldown = cfg.clickDelayTicks;
-					return;
-				}
-			}
-		}
 
 		// 2) Szukamy najtańszej pasującej oferty na tej stronie
 		Slot best = null;
@@ -111,6 +114,7 @@ public class AhBuyer {
 		if (best != null) {
 			mc.interactionManager.clickSlot(h.syncId, best.id, 0, SlotActionType.PICKUP, mc.player);
 			mc.player.sendMessage(Text.literal("§a[AH Buyer] §fKlik: " + bestName + " za " + bestPrice), false);
+			awaitConfirmUntil = now + 8000;
 			pendingPrev = false;
 			cooldown = cfg.clickDelayTicks;
 			lastActionAt = now;
@@ -126,14 +130,11 @@ public class AhBuyer {
 				mc.player.sendMessage(Text.literal("§e[AH Buyer] Poprzednia strona"), true);
 				cooldown = cfg.clickDelayTicks + 4;
 				lastActionAt = now;
-				return;
 			}
-			mc.player.closeHandledScreen();
-			cooldown = 10;
 			return;
 		}
 
-		// 4) Odświeżenie: kliknij następną stronę
+		// 4) Odświeżenie: kliknij następną stronę (bez zamykania AH)
 		long wait = Math.max(600L, (long) (cfg.refreshSeconds * 1000 / 3));
 		if (now - lastActionAt >= wait) {
 			Slot next = findButton(h, size, NEXT_WORDS);
@@ -143,12 +144,9 @@ public class AhBuyer {
 				pendingPrev = true;
 				cooldown = cfg.clickDelayTicks + 6;
 				lastActionAt = now;
-				return;
-			}
-			if (now - lastActionAt >= (long) (cfg.refreshSeconds * 1000)) {
+			} else if (now - lastWarn > 5000) {
+				lastWarn = now;
 				mc.player.sendMessage(Text.literal("§c[AH Buyer] Nie widze przycisku Nastepna strona"), true);
-				mc.player.closeHandledScreen();
-				cooldown = 10;
 			}
 		}
 	}
